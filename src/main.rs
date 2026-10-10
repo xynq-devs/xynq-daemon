@@ -12,10 +12,7 @@ mod id;
 
 mod logging;
 
-use std::{
-    env,
-    time::Duration,
-};
+use std::env;
 
 use tokio::sync::{
     mpsc,
@@ -34,8 +31,6 @@ use crate::{
     network::NetworkService,
     service::Service,
 };
-
-const RETRY_DELAY: Duration = Duration::from_mins(1);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {

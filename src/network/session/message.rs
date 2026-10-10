@@ -27,7 +27,7 @@ pub struct HandshakeMessage {
     // Random nonce (used to prevent replay attacks)
     pub nonce: [u8; 32],
 
-    // Signed using the cluster secret key, over the timestamp and nonce
+    // Signed using the cluster secret key over identity, timestamp, and nonce
     pub signature: [u8; 32],
 }
 

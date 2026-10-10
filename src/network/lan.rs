@@ -4,14 +4,12 @@ mod discovery;
 mod crypto;
 
 use std::{
-    net::{
-        Ipv4Addr,
-        SocketAddr,
-    },
+    collections::HashSet,
+    net::{Ipv4Addr, SocketAddr},
     sync::Arc,
 };
 
-use tokio::sync::mpsc;
+use tokio::{sync::mpsc, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{
     Instrument,
@@ -130,6 +128,11 @@ impl Service<(), StreamReadyEvent> for LanService {
     }
 
     async fn run(mut self) {
+        // Own connection tasks and deduplicate repeated mDNS announcements by address.
+        // JoinSet aborts remaining tasks when this service is dropped.
+        let mut connection_tasks: JoinSet<(Option<SocketAddr>, anyhow::Result<()>)> = JoinSet::new();
+        let mut pending_outgoing = HashSet::new();
+
         loop {
             if let Err(err) = DiscoveryService::start(
                 self.discovery_token.clone(),
@@ -142,12 +145,37 @@ impl Service<(), StreamReadyEvent> for LanService {
 
             loop {
                 tokio::select! {
-                    Some(incoming) = self.endpoint.accept() => {
-                        tokio::spawn(accept_connection(incoming, self.stream_ready_event_tx.clone()));
+                    Some(incoming) = self.endpoint.accept(), if connection_tasks.len() < 128 => {
+                        let event_tx = self.stream_ready_event_tx.clone();
+                        let token = self.token.child_token();
+                        connection_tasks.spawn(async move {
+                            (None, accept_connection(incoming, event_tx, token).await)
+                        });
                     }
 
-                    Some(discovery::Event::PeerDiscovered { addr }) = self.discovery_event_rx.recv() => {
-                        tokio::spawn(initiate_connection(addr, self.endpoint.clone(), self.stream_ready_event_tx.clone()));
+                    Some(discovery::Event::PeerDiscovered { addr }) = self.discovery_event_rx.recv(),
+                        if connection_tasks.len() < 128 && !pending_outgoing.contains(&addr) => {
+                        pending_outgoing.insert(addr);
+                        let endpoint = self.endpoint.clone();
+                        let event_tx = self.stream_ready_event_tx.clone();
+                        let token = self.token.child_token();
+                        connection_tasks.spawn(async move {
+                            (Some(addr), initiate_connection(addr, endpoint, event_tx, token).await)
+                        });
+                    }
+
+                    Some(result) = connection_tasks.join_next(), if !connection_tasks.is_empty() => {
+                        match result {
+                            Ok((addr, result)) => {
+                                if let Some(addr) = addr {
+                                    pending_outgoing.remove(&addr);
+                                }
+                                if let Err(err) = result {
+                                    debug!(reason = %err, "LAN connection attempt ended");
+                                }
+                            }
+                            Err(err) => warn!(reason = %err, "LAN connection task failed"),
+                        }
                     }
 
                     _ = self.discovery_token.cancelled() => {
@@ -168,7 +196,11 @@ impl Service<(), StreamReadyEvent> for LanService {
 async fn accept_connection(
     incoming: quinn::Incoming,
     event_tx: mpsc::Sender<StreamReadyEvent>,
+    token: CancellationToken,
 ) -> anyhow::Result<()> {
+    tokio::select! {
+        _ = token.cancelled() => Ok(()),
+        result = async move {
     let addr = incoming.remote_address();
 
     debug!(address = %addr, "accepting connection");
@@ -196,13 +228,19 @@ async fn accept_connection(
         .await?;
 
     Ok(())
+        } => result
+    }
 }
 
 async fn initiate_connection(
     addr: SocketAddr,
     endpoint: quinn::Endpoint,
     event_tx: mpsc::Sender<StreamReadyEvent>,
+    token: CancellationToken,
 ) -> anyhow::Result<()> {
+    tokio::select! {
+        _ = token.cancelled() => Ok(()),
+        result = async move {
     debug!(address = %addr, "initiating connection");
 
     let connection = endpoint
@@ -228,4 +266,6 @@ async fn initiate_connection(
         .await?;
 
     Ok(())
+        } => result
+    }
 }

@@ -1,27 +1,20 @@
 mod message;
 mod sign;
 
-use std::sync::Arc;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 use chrono::Utc;
-use quinn::{
-    RecvStream,
-    SendStream,
-};
+use quinn::{RecvStream, SendStream};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{
-    Instrument,
-    debug,
-    error,
-    info,
-    warn,
-};
-use xynq_proto::{
-    DeviceCommand,
-    DeviceEvent,
-    DeviceState,
-};
+use tracing::{Instrument, debug, info, warn};
+use xynq_proto::{DeviceCommand, DeviceEvent, DeviceState};
 
 use crate::{
     config::PeerConfig,
@@ -29,80 +22,54 @@ use crate::{
     network::{
         SessionKind,
         session::{
-            message::{
-                DeviceMessage,
-                HandshakeMessage,
-            },
-            sign::{
-                sign_handshake,
-                verify_handshake,
-            },
+            message::{DeviceMessage, HandshakeMessage},
+            sign::{sign_handshake, verify_handshake},
         },
     },
     service::Service,
-    transport::{
-        recv_bytes,
-        send_bytes,
-    },
+    transport::{recv_bytes, send_bytes},
 };
+
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 pub struct SessionService {
     token: CancellationToken,
-
-    // channels
     event_tx: mpsc::Sender<SessionEvent>,
-
-    // config
     peer_config: Arc<PeerConfig>,
-
-    // stream
     session_kind: SessionKind,
-    send: quinn::SendStream,
-    recv: quinn::RecvStream,
+    send: SendStream,
+    recv: RecvStream,
 }
 
 impl Service<SendToPeer, SessionEvent> for SessionService {
-    type Params = (
-        quinn::SendStream,
-        quinn::RecvStream,
-        SessionKind,
-        Arc<PeerConfig>,
-    );
+    type Params = (SendStream, RecvStream, SessionKind, Arc<PeerConfig>);
 
     fn start(
         token: CancellationToken,
         _command_rx: Option<mpsc::Receiver<SendToPeer>>,
         event_tx: Option<mpsc::Sender<SessionEvent>>,
-        (send, recv, stream_mode, peer_config): Self::Params,
+        (send, recv, session_kind, peer_config): Self::Params,
     ) -> anyhow::Result<()> {
         let event_tx = event_tx.ok_or_else(|| anyhow::anyhow!("event sender missing"))?;
 
         let service = Self {
             token: token.clone(),
-
             event_tx,
-
             peer_config,
-
-            session_kind: stream_mode,
+            session_kind,
             send,
             recv,
         };
 
+        // run() owns cancellation and cleanup so SessionClosed is emitted once,
+        // regardless of which stream ends first or whether shutdown is requested.
         tokio::spawn(
             async move {
-                info!("service started");
-                tokio::select! {
-                    _ = token.cancelled() => {
-                        debug!("token cancelled");
-                    }
-                    _ = service.run() => {
-                        // Service run completed, likely due to an error or stream closure.
-                        // Cancel the token to inform the parent and stop any child tasks.
-                        token.cancel();
-                    }
-                }
-                info!("service stopped");
+                info!("session started");
+                service.run().await;
+                token.cancel();
+                info!("session stopped");
             }
             .in_current_span(),
         );
@@ -111,12 +78,96 @@ impl Service<SendToPeer, SessionEvent> for SessionService {
     }
 
     async fn run(mut self) {
-        // create handshake message with timestamp, random nonce, and signature
+        let token = self.token.clone();
+        let (peer_id, peer_name) = tokio::select! {
+            _ = token.cancelled() => {
+                debug!("session cancelled during handshake");
+                return;
+            }
+            result = tokio::time::timeout(HANDSHAKE_TIMEOUT, self.authenticate()) => {
+                match result {
+                    Ok(Ok(peer)) => peer,
+                    Ok(Err(err)) => {
+                        warn!(reason = %err, "peer handshake failed");
+                        return;
+                    }
+                    Err(_) => {
+                        warn!(timeout_secs = HANDSHAKE_TIMEOUT.as_secs(), "peer handshake timed out");
+                        return;
+                    }
+                }
+            }
+        };
+
+        if peer_id == self.peer_config.peer_id {
+            warn!("rejecting self-connection");
+            return;
+        }
+
+        let session_id = NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed);
+        let (command_tx, mut command_rx) = mpsc::channel(64);
+
+        tokio::select! {
+            _ = token.cancelled() => {
+                debug!(session_id, "session cancelled before activation");
+                return;
+            }
+            result = self.event_tx.send(SessionEvent::SessionReady {
+                peer_id,
+                peer_name,
+                session_kind: self.session_kind,
+                session_id,
+                session_command_tx: command_tx,
+            }) => {
+                if result.is_err() {
+                    warn!("event channel closed before session became active");
+                    return;
+                }
+            }
+        }
+
+        // One supervisor owns both stream futures. The first failure/cancellation
+        // drops the other future and emits exactly one close event.
+        let token = self.token.clone();
+        tokio::select! {
+            _ = token.cancelled() => {
+                debug!(session_id, "session cancellation requested");
+            }
+            result = handle_recv_stream(&mut self.recv, &self.event_tx, peer_id) => {
+                if let Err(err) = result {
+                    warn!(session_id, reason = %err, "receive stream ended");
+                }
+            }
+            result = handle_send_stream(&mut self.send, &mut command_rx) => {
+                if let Err(err) = result {
+                    warn!(session_id, reason = %err, "send stream ended");
+                }
+            }
+        }
+
+        if self.event_tx.send(SessionEvent::SessionClosed {
+            peer_id,
+            session_kind: self.session_kind,
+            session_id,
+        }).await.is_err() {
+            debug!(peer_id = %peer_id, session_id, "event channel closed while reporting session close");
+        }
+    }
+}
+
+impl SessionService {
+    async fn authenticate(&mut self) -> anyhow::Result<(PeerId, Arc<str>)> {
         let timestamp = Utc::now().timestamp();
         let nonce = rand::random::<[u8; 32]>();
-        let signature = sign_handshake(&self.peer_config.secret, timestamp, &nonce);
+        let signature = sign_handshake(
+            &self.peer_config.secret,
+            self.peer_config.peer_id,
+            &self.peer_config.peer_name,
+            timestamp,
+            &nonce,
+        );
 
-        let msg = HandshakeMessage {
+        let handshake = HandshakeMessage {
             peer_id: self.peer_config.peer_id,
             peer_name: self.peer_config.peer_name.clone(),
             timestamp,
@@ -124,108 +175,30 @@ impl Service<SendToPeer, SessionEvent> for SessionService {
             signature,
         };
 
-        // Serialize the handshake message to bytes
-        let Ok(bytes) = postcard::to_allocvec(&msg) else {
-            error!(
-                reason = "invalid type",
-                "failed to serialize HandshakeMessage"
-            );
-            return;
-        };
+        let bytes = postcard::to_allocvec(&handshake)?;
+        // Both handshake and application messages use the same length-prefixed framing.
+        send_bytes(&mut self.send, bytes).await?;
 
-        // Send the handshake message bytes to the peer
-        if let Err(err) = self.send.write_all(&bytes).await {
-            error!(reason = %err, "failed to send HandshakeMessage");
-            return;
-        }
+        let bytes = recv_bytes(&mut self.recv).await?;
+        let remote: HandshakeMessage = postcard::from_bytes(&bytes)
+            .map_err(|err| anyhow::anyhow!("invalid handshake payload: {err}"))?;
 
-        let bytes = match recv_bytes(&mut self.recv).await {
-            Ok(b) => b,
-            Err(err) => {
-                error!(reason = %err, "failed to receive HandshakeMessage");
-                return;
-            }
-        };
-
-        let Ok(msg): Result<HandshakeMessage, _> = postcard::from_bytes(&bytes) else {
-            error!(
-                reason = "invalid bytes",
-                "failed to deserialize HandshakeMessage"
-            );
-            return;
-        };
-
-        if msg.timestamp.abs_diff(Utc::now().timestamp()) > 10 {
-            error!(
-                reason = "timestamp out of allowed window",
-                "handshake rejected"
-            );
-            return;
+        if remote.timestamp.abs_diff(Utc::now().timestamp()) > 10 {
+            anyhow::bail!("handshake timestamp outside allowed window");
         }
 
         if !verify_handshake(
             &self.peer_config.secret,
-            msg.timestamp,
-            msg.nonce,
-            &msg.signature,
+            remote.peer_id,
+            &remote.peer_name,
+            remote.timestamp,
+            &remote.nonce,
+            &remote.signature,
         ) {
-            error!(reason = "invalid signature", "handshake rejected");
-            return;
+            anyhow::bail!("invalid handshake signature");
         }
 
-        let (command_tx, mut command_rx) = mpsc::channel(64);
-
-        if self
-            .event_tx
-            .send(SessionEvent::SessionReady {
-                peer_id: msg.peer_id,
-                peer_name: msg.peer_name,
-                session_kind: self.session_kind,
-                session_command_tx: command_tx,
-            })
-            .await
-            .is_err()
-        {
-            warn!(
-                reason = "channel closed",
-                "failed to send SessionReady event"
-            );
-            return;
-        }
-
-        // Start a task to handle the recv stream, and cancel the token if the task ends (either due to stream closure or an error)
-        tokio::spawn(
-            async move {
-                tokio::select! {
-                    _ = self.token.cancelled() => {
-                        // Service cancelled
-                    }
-                    _ = handle_recv_stream(self.recv, &self.event_tx, msg.peer_id) => {
-                        // Task completed, likely due to stream closure or an error.
-                        // Cancel the token to stop the service and inform the parent.
-                        self.token.cancel();
-                    }
-                }
-
-                if self
-                    .event_tx
-                    .send(SessionEvent::SessionClosed {
-                        peer_id: msg.peer_id,
-                        session_kind: self.session_kind,
-                    })
-                    .await
-                    .is_err()
-                {
-                    warn!(
-                        reason = "channel closed",
-                        "failed to send SessionClosed event"
-                    );
-                }
-            }
-            .in_current_span(),
-        );
-
-        handle_send_stream(self.send, &mut command_rx).await;
+        Ok((remote.peer_id, remote.peer_name))
     }
 }
 
@@ -240,11 +213,13 @@ pub enum SessionEvent {
         peer_id: PeerId,
         peer_name: Arc<str>,
         session_kind: SessionKind,
+        session_id: u64,
         session_command_tx: mpsc::Sender<SendToPeer>,
     },
     SessionClosed {
         peer_id: PeerId,
         session_kind: SessionKind,
+        session_id: u64,
     },
     ReceivedDeviceState {
         peer_id: PeerId,
@@ -261,43 +236,30 @@ pub enum SessionEvent {
 }
 
 async fn handle_recv_stream(
-    mut recv: RecvStream,
+    recv: &mut RecvStream,
     event_tx: &mpsc::Sender<SessionEvent>,
     peer_id: PeerId,
-) {
+) -> anyhow::Result<()> {
     loop {
-        let bytes = match recv_bytes(&mut recv).await {
-            Ok(b) => b,
-            Err(err) => {
-                warn!(reason = %err, "failed to receive DeviceMessage");
-                return;
-            }
-        };
-
-        let Ok(msg) = postcard::from_bytes(&bytes) else {
-            debug!(
-                reason = "invalid bytes",
-                "failed to deserialize DeviceMessage"
-            );
-            continue;
-        };
+        let bytes = recv_bytes(recv).await?;
+        let msg: DeviceMessage = postcard::from_bytes(&bytes)
+            .map_err(|err| anyhow::anyhow!("invalid DeviceMessage: {err}"))?;
 
         let event = match msg {
             DeviceMessage::State(state) => SessionEvent::ReceivedDeviceState { peer_id, state },
             DeviceMessage::Event(event) => SessionEvent::ReceivedDeviceEvent { peer_id, event },
-            DeviceMessage::Command(command) => {
-                SessionEvent::ReceivedDeviceCommand { peer_id, command }
-            }
+            DeviceMessage::Command(command) => SessionEvent::ReceivedDeviceCommand { peer_id, command },
         };
 
-        if event_tx.send(event).await.is_err() {
-            error!(reason = "channel closed", "failed to send Event");
-            return;
-        }
+        event_tx.send(event).await
+            .map_err(|_| anyhow::anyhow!("session event channel closed"))?;
     }
 }
 
-async fn handle_send_stream(mut send: SendStream, command_rx: &mut mpsc::Receiver<SendToPeer>) {
+async fn handle_send_stream(
+    send: &mut SendStream,
+    command_rx: &mut mpsc::Receiver<SendToPeer>,
+) -> anyhow::Result<()> {
     while let Some(command) = command_rx.recv().await {
         let msg = match command {
             SendToPeer::State(state) => DeviceMessage::State(state),
@@ -305,15 +267,10 @@ async fn handle_send_stream(mut send: SendStream, command_rx: &mut mpsc::Receive
             SendToPeer::Command(command) => DeviceMessage::Command(command),
         };
 
-        let Ok(buf) = postcard::to_allocvec(&msg) else {
-            warn!(reason = "invalid type", "failed to serialize DeviceMessage");
-            continue;
-        };
-
-        if let Err(err) = send_bytes(&mut send, buf).await {
-            warn!(reason = %err, "failed to send DeviceMessage");
-            return;
-        }
+        let buf = postcard::to_allocvec(&msg)
+            .map_err(|err| anyhow::anyhow!("failed to serialize DeviceMessage: {err}"))?;
+        send_bytes(send, buf).await?;
     }
-    error!(reason = "channel closed", "failed to receive Command");
+
+    Ok(())
 }

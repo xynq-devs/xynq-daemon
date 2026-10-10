@@ -74,16 +74,10 @@ impl Service<Command, Event> for NetworkService {
         tokio::spawn(
             async move {
                 info!("service started");
-                tokio::select! {
-                    _ = token.cancelled() => {
-                        debug!("token cancelled");
-                    },
-                    _ = service.run() => {
-                        // Service run completed, likely due to an error or stream closure.
-                        // Cancel the token to inform the parent and stop any child tasks.
-                        token.cancel();
-                    }
-                }
+                // Let run() observe cancellation and drain its active-peer registry
+                // before returning; selecting cancellation here would drop that cleanup.
+                service.run().await;
+                token.cancel();
                 info!("service stopped");
             }
             .in_current_span(),
@@ -94,7 +88,11 @@ impl Service<Command, Event> for NetworkService {
 
     async fn run(mut self) {
         loop {
-            // we
+            if self.token.is_cancelled() {
+                return;
+            }
+
+            // Start a fresh service generation.
             let shared_service_token = self.token.child_token();
 
             // Create a stream ready event channel for LAN and Relay services to get notified when a new stream is ready to start a session.
@@ -157,7 +155,7 @@ impl Service<Command, Event> for NetworkService {
                         let _ =  handle_command(command, &retry_conn_command_tx, &mut active_sessions).await;
                     },
                     Some(StreamReadyEvent { session_kind, send, recv }) = stream_ready_event_rx.recv() => {
-                        create_session(send, recv, session_kind, &session_event_tx, &self.token, &self.config.peer_config);
+                        create_session(send, recv, session_kind, &session_event_tx, &shared_service_token, &self.config.peer_config);
                     }
                     _ = shared_service_token.cancelled() => {
                         debug!("restarting services");
@@ -169,6 +167,15 @@ impl Service<Command, Event> for NetworkService {
                         }
                     }
 
+                }
+            }
+
+            // The service generation is ending; report remaining peers as disconnected
+            // before the active-session registry is discarded.
+            let disconnected_peers: Vec<_> = active_sessions.keys().copied().collect();
+            for peer_id in disconnected_peers {
+                if self.event_tx.send(Event::PeerDisconnected { peer_id }).await.is_err() {
+                    return;
                 }
             }
         }
@@ -225,11 +232,22 @@ struct StreamReadyEvent {
 // Sessions Map to store the channels to Session handlers
 type Sessions = HashMap<PeerId, SessionCommandChannel>;
 
-// This struct holds the command channels
+struct SessionHandle {
+    session_id: u64,
+    sender: mpsc::Sender<session::SendToPeer>,
+}
+
+// Session IDs prevent late close events from removing replacement sessions.
 #[derive(Default)]
 struct SessionCommandChannel {
-    local: Option<mpsc::Sender<session::SendToPeer>>,
-    relay: Option<mpsc::Sender<session::SendToPeer>>,
+    local: Option<SessionHandle>,
+    relay: Option<SessionHandle>,
+}
+
+impl SessionCommandChannel {
+    fn is_connected(&self) -> bool {
+        self.local.is_some() || self.relay.is_some()
+    }
 }
 
 // Session kind to differentiate between LAN and Relay sessions
@@ -271,7 +289,7 @@ async fn handle_command(
                 return Ok(());
             };
 
-            if session_command_tx
+            if session_command_tx.sender
                 .send(session::SendToPeer::State(state))
                 .await
                 .is_err()
@@ -292,7 +310,7 @@ async fn handle_command(
                     continue;
                 };
 
-                if session_command_tx
+                if session_command_tx.sender
                     .send(session::SendToPeer::Event(event.clone()))
                     .await
                     .is_err()
@@ -317,7 +335,7 @@ async fn handle_command(
                 return Ok(());
             };
 
-            if session_command_tx
+            if session_command_tx.sender
                 .send(session::SendToPeer::Command(command))
                 .await
                 .is_err()
@@ -359,55 +377,116 @@ async fn handle_session_event(
 ) -> anyhow::Result<()> {
     let event = match session_event {
         session::SessionEvent::SessionReady {
-            peer_id,
-            peer_name,
-            session_kind,
-            session_command_tx,
+            peer_id, peer_name, session_kind, session_id, session_command_tx,
         } => {
-            active_sessions
-                .entry(peer_id)
-                .and_modify(|session_command_channel| match session_kind {
-                    SessionKind::Lan => session_command_channel.local = Some(session_command_tx),
-                    SessionKind::Relay => session_command_channel.relay = Some(session_command_tx),
-                })
-                .or_default();
-
-            Event::PeerConnected { peer_id, peer_name }
-        }
-        session::SessionEvent::SessionClosed {
-            peer_id,
-            session_kind,
-        } => {
-            if let Some(session_command_channel) = active_sessions.get_mut(&peer_id) {
-                match session_kind {
-                    SessionKind::Lan => session_command_channel.local = None,
-                    SessionKind::Relay => session_command_channel.relay = None,
-                }
-
-                if session_command_channel.local.is_none()
-                    && session_command_channel.relay.is_none()
-                {
-                    active_sessions.remove(&peer_id);
-                }
+            let channels = active_sessions.entry(peer_id).or_default();
+            let was_connected = channels.is_connected();
+            let handle = SessionHandle { session_id, sender: session_command_tx };
+            match session_kind {
+                SessionKind::Lan => channels.local = Some(handle),
+                SessionKind::Relay => channels.relay = Some(handle),
             }
-
-            Event::PeerDisconnected { peer_id }
+            if was_connected { None } else { Some(Event::PeerConnected { peer_id, peer_name }) }
         }
-        session::SessionEvent::ReceivedDeviceState { peer_id, state } => {
-            Event::DeviceStateReceivedFromPeer { peer_id, state }
+        session::SessionEvent::SessionClosed { peer_id, session_kind, session_id } => {
+            let Some(channels) = active_sessions.get_mut(&peer_id) else { return Ok(()); };
+            let slot = match session_kind {
+                SessionKind::Lan => &mut channels.local,
+                SessionKind::Relay => &mut channels.relay,
+            };
+            if slot.as_ref().is_none_or(|session| session.session_id != session_id) {
+                return Ok(());
+            }
+            *slot = None;
+            if channels.is_connected() {
+                None
+            } else {
+                active_sessions.remove(&peer_id);
+                Some(Event::PeerDisconnected { peer_id })
+            }
         }
-        session::SessionEvent::ReceivedDeviceEvent { peer_id, event } => {
-            Event::DeviceEventReceivedFromPeer { peer_id, event }
-        }
-        session::SessionEvent::ReceivedDeviceCommand { peer_id, command } => {
-            Event::DeviceCommandReceivedFromPeer { peer_id, command }
-        }
+        session::SessionEvent::ReceivedDeviceState { peer_id, state } => Some(Event::DeviceStateReceivedFromPeer { peer_id, state }),
+        session::SessionEvent::ReceivedDeviceEvent { peer_id, event } => Some(Event::DeviceEventReceivedFromPeer { peer_id, event }),
+        session::SessionEvent::ReceivedDeviceCommand { peer_id, command } => Some(Event::DeviceCommandReceivedFromPeer { peer_id, command }),
     };
-
-    if event_tx.send(event).await.is_err() {
-        warn!(reason = "channel closed", "failed to send Event");
-        anyhow::bail!("event channel closed");
+    if let Some(event) = event {
+        if event_tx.send(event).await.is_err() {
+            warn!(reason = "channel closed", "failed to send Event");
+            anyhow::bail!("event channel closed");
+        }
     }
-
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use tokio::sync::mpsc;
+
+    use super::{Event, SessionKind, Sessions, handle_session_event};
+    use crate::id::PeerId;
+    use crate::network::session::{SendToPeer, SessionEvent};
+
+    #[tokio::test]
+    async fn stale_close_does_not_remove_replacement_or_disconnect_peer_early() {
+        let peer_id = PeerId::default();
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let (command_tx_1, _command_rx_1) = mpsc::channel::<SendToPeer>(1);
+        let (command_tx_2, _command_rx_2) = mpsc::channel::<SendToPeer>(1);
+        let (command_tx_3, _command_rx_3) = mpsc::channel::<SendToPeer>(1);
+        let mut sessions = Sessions::new();
+
+        handle_session_event(SessionEvent::SessionReady {
+            peer_id,
+            peer_name: Arc::from("device"),
+            session_kind: SessionKind::Lan,
+            session_id: 1,
+            session_command_tx: command_tx_1,
+        }, &mut sessions, &event_tx).await.unwrap();
+        assert!(matches!(event_rx.recv().await, Some(Event::PeerConnected { .. })));
+
+        // Replacing the LAN session must not emit a second peer-connected event.
+        handle_session_event(SessionEvent::SessionReady {
+            peer_id,
+            peer_name: Arc::from("device"),
+            session_kind: SessionKind::Lan,
+            session_id: 2,
+            session_command_tx: command_tx_2,
+        }, &mut sessions, &event_tx).await.unwrap();
+        assert!(event_rx.try_recv().is_err());
+
+        // A delayed close from the replaced session must be ignored.
+        handle_session_event(SessionEvent::SessionClosed {
+            peer_id,
+            session_kind: SessionKind::Lan,
+            session_id: 1,
+        }, &mut sessions, &event_tx).await.unwrap();
+        assert!(event_rx.try_recv().is_err());
+
+        // LAN and relay are independent routes to the same peer.
+        handle_session_event(SessionEvent::SessionReady {
+            peer_id,
+            peer_name: Arc::from("device"),
+            session_kind: SessionKind::Relay,
+            session_id: 3,
+            session_command_tx: command_tx_3,
+        }, &mut sessions, &event_tx).await.unwrap();
+        assert!(event_rx.try_recv().is_err());
+
+        handle_session_event(SessionEvent::SessionClosed {
+            peer_id,
+            session_kind: SessionKind::Lan,
+            session_id: 2,
+        }, &mut sessions, &event_tx).await.unwrap();
+        assert!(event_rx.try_recv().is_err());
+
+        handle_session_event(SessionEvent::SessionClosed {
+            peer_id,
+            session_kind: SessionKind::Relay,
+            session_id: 3,
+        }, &mut sessions, &event_tx).await.unwrap();
+        assert!(matches!(event_rx.recv().await, Some(Event::PeerDisconnected { .. })));
+        assert!(sessions.is_empty());
+    }
 }

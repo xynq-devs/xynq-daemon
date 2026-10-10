@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use rustls::pki_types::PrivateKeyDer;
 use x509_parser::prelude::{
     FromDer,
     X509Certificate,
@@ -77,8 +78,10 @@ impl TryFrom<xynq_proto::LanConfig> for LanConfig {
         }
 
         let key_der = value.key_der;
-        if X509Certificate::from_der(&key_der).is_err() {
-            return Err(anyhow::anyhow!("invalid key DER"));
+        if PrivateKeyDer::try_from(key_der.as_slice()).is_err() {
+            return Err(anyhow::anyhow!(
+                "invalid private key DER; expected a supported DER-encoded private key"
+            ));
         }
 
         Ok(Self {

@@ -20,7 +20,7 @@ use quinn::{
     RecvStream,
     SendStream,
 };
-use tokio::sync::mpsc;
+use tokio::{sync::mpsc, task::JoinSet};
 use tokio_util::sync::CancellationToken;
 use tracing::{
     Instrument,
@@ -35,7 +35,6 @@ use xynq_proto::{
 };
 
 use crate::{
-    RETRY_DELAY,
     config::RelayConfig,
     id::{
         ClusterId,
@@ -136,98 +135,153 @@ impl Service<RetryConnectionCommand, StreamReadyEvent> for RelayService {
     }
 
     async fn run(mut self) {
+        const MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
+        const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
         let mut delay = Duration::ZERO;
 
         loop {
             tokio::select! {
                 _ = tokio::time::sleep(delay) => {}
-                Some(RetryConnectionCommand) = self.retry_conn_command_rx.recv() => {}
-                else => {
-                    error!(reason = "channel closed", "failed to receive Command");
-                    return;
-                }
-            };
-            delay = RETRY_DELAY;
-
-            let addrs =
-                match resolve_relay_address(&self.resolver, &self.relay_url, self.relay_port).await
-                {
-                    Ok(addrs) => addrs,
-                    Err(err) => {
-                        warn!(reason = %err, "failed to resolve relay address");
-                        continue;
+                command = self.retry_conn_command_rx.recv() => {
+                    if command.is_none() {
+                        error!("relay retry command channel closed");
+                        return;
                     }
-                };
+                    // Explicit retry bypasses the current backoff.
+                    delay = Duration::ZERO;
+                }
+            }
 
-            let conn = match try_connect(&self.endpoint, addrs).await {
-                Some(conn) => conn,
-                None => {
+            let addrs = match tokio::time::timeout(
+                CONNECT_TIMEOUT,
+                resolve_relay_address(&self.resolver, &self.relay_url, self.relay_port),
+            ).await {
+                Ok(Ok(addrs)) if !addrs.is_empty() => addrs,
+                Ok(Ok(_)) => {
+                    warn!("relay DNS lookup returned no addresses");
+                    delay = next_retry_delay(delay, MAX_RETRY_DELAY);
+                    continue;
+                }
+                Ok(Err(err)) => {
+                    warn!(reason = %err, "failed to resolve relay address");
+                    delay = next_retry_delay(delay, MAX_RETRY_DELAY);
+                    continue;
+                }
+                Err(_) => {
+                    warn!("relay DNS resolution timed out");
+                    delay = next_retry_delay(delay, MAX_RETRY_DELAY);
+                    continue;
+                }
+            };
+
+            let conn = match tokio::time::timeout(CONNECT_TIMEOUT, try_connect(&self.endpoint, addrs)).await {
+                Ok(Some(conn)) => conn,
+                Ok(None) => {
                     warn!("failed to connect to relay at any resolved address");
+                    delay = next_retry_delay(delay, MAX_RETRY_DELAY);
+                    continue;
+                }
+                Err(_) => {
+                    warn!("relay connection attempt timed out");
+                    delay = next_retry_delay(delay, MAX_RETRY_DELAY);
                     continue;
                 }
             };
 
-            let (mut send, mut recv) = match conn.open_bi().await {
-                Ok(s) => s,
-                Err(err) => {
+            let (mut send, mut recv) = match tokio::time::timeout(CONNECT_TIMEOUT, conn.open_bi()).await {
+                Ok(Ok(streams)) => streams,
+                Ok(Err(err)) => {
                     warn!(reason = %err, "failed to open stream to relay");
-                    debug!("closing connection");
+                    delay = next_retry_delay(delay, MAX_RETRY_DELAY);
+                    continue;
+                }
+                Err(_) => {
+                    warn!("opening relay control stream timed out");
+                    delay = next_retry_delay(delay, MAX_RETRY_DELAY);
                     continue;
                 }
             };
 
-            if let Err(err) = send_join_cluster_req(&mut send, self.cluster_id, self.peer_id).await
-            {
-                warn!(reason = %err, "failed to send JoinClusterRequest to relay");
-                debug!("closing connection");
+            if let Err(err) = tokio::time::timeout(
+                CONNECT_TIMEOUT,
+                send_join_cluster_req(&mut send, self.cluster_id, self.peer_id),
+            ).await.map_err(|_| anyhow::anyhow!("sending relay join request timed out")).and_then(|result| result) {
+                warn!(reason = %err, "failed to join relay cluster");
+                delay = next_retry_delay(delay, MAX_RETRY_DELAY);
                 continue;
             }
 
-            let peer_count = match recv_join_cluster_response(&mut recv).await {
-                Ok(JoinClusterResponse { peer_count }) => peer_count,
-                Err(err) => {
-                    warn!(reason = %err, "failed to receive JoinClusterResponse from relay");
-                    debug!("closing connection");
+            let peer_count = match tokio::time::timeout(
+                CONNECT_TIMEOUT,
+                recv_join_cluster_response(&mut recv),
+            ).await {
+                Ok(Ok(JoinClusterResponse { peer_count })) => peer_count,
+                Ok(Err(err)) => {
+                    warn!(reason = %err, "failed to receive relay join response");
+                    delay = next_retry_delay(delay, MAX_RETRY_DELAY);
+                    continue;
+                }
+                Err(_) => {
+                    warn!("receiving relay join response timed out");
+                    delay = next_retry_delay(delay, MAX_RETRY_DELAY);
                     continue;
                 }
             };
 
+            // Reset backoff after a successful connection. If it drops, retry quickly.
+            delay = Duration::ZERO;
+
+            // Supervise locally opened streams. JoinSet aborts unfinished opens if
+            // the relay connection drops or the service is cancelled.
+            let mut stream_tasks = JoinSet::new();
             for _ in 0..peer_count {
-                tokio::spawn(
-                    open_stream_for_peer(conn.clone(), self.stream_ready_event_tx.clone())
-                        .in_current_span(),
-                );
+                let conn = conn.clone();
+                let event_tx = self.stream_ready_event_tx.clone();
+                stream_tasks.spawn(open_stream_for_peer(conn, event_tx).in_current_span());
             }
 
             loop {
-                let (send, recv) = match conn.accept_bi().await {
-                    Ok(s) => s,
-                    Err(err) => {
-                        warn!(reason = %err, "failed to accept stream from relay");
-                        break;
+                tokio::select! {
+                    accepted = conn.accept_bi() => {
+                        let (send, recv) = match accepted {
+                            Ok(streams) => streams,
+                            Err(err) => {
+                                warn!(reason = %err, "relay connection closed");
+                                break;
+                            }
+                        };
+
+                        if self.stream_ready_event_tx.send(StreamReadyEvent {
+                            session_kind: SessionKind::Relay,
+                            send,
+                            recv,
+                        }).await.is_err() {
+                            warn!("stream-ready event channel closed");
+                            return;
+                        }
                     }
-                };
-
-                if self
-                    .stream_ready_event_tx
-                    .send(StreamReadyEvent {
-                        session_kind: SessionKind::Relay,
-                        send,
-                        recv,
-                    })
-                    .await
-                    .is_err()
-                {
-                    warn!(
-                        reason = "channel closed",
-                        "failed to send StreamReady event"
-                    );
-
-                    // Stop the service because the event channel is closed
-                    return;
+                    Some(result) = stream_tasks.join_next(), if !stream_tasks.is_empty() => {
+                        match result {
+                            Ok(Ok(())) => {}
+                            Ok(Err(err)) => warn!(reason = %err, "failed to open peer stream through relay"),
+                            Err(err) => warn!(reason = %err, "relay stream task failed"),
+                        }
+                    }
                 }
             }
+
+            stream_tasks.abort_all();
+            while stream_tasks.join_next().await.is_some() {}
+            delay = next_retry_delay(delay, MAX_RETRY_DELAY);
         }
+    }
+}
+
+fn next_retry_delay(current: Duration, maximum: Duration) -> Duration {
+    if current.is_zero() {
+        Duration::from_secs(1)
+    } else {
+        current.saturating_mul(2).min(maximum)
     }
 }
 
@@ -304,4 +358,20 @@ async fn open_stream_for_peer(
         .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::next_retry_delay;
+
+    #[test]
+    fn relay_backoff_grows_and_caps() {
+        let max = Duration::from_secs(60);
+        assert_eq!(next_retry_delay(Duration::ZERO, max), Duration::from_secs(1));
+        assert_eq!(next_retry_delay(Duration::from_secs(1), max), Duration::from_secs(2));
+        assert_eq!(next_retry_delay(Duration::from_secs(32), max), max);
+        assert_eq!(next_retry_delay(max, max), max);
+    }
 }
